@@ -17,6 +17,8 @@ const initialData = {
         tempoBpm: 82,
         paperType: "半透明纸带"
       },
+      sealed: false,
+      sealedAt: null,
       createdAt: new Date().toISOString()
     }
   ],
@@ -65,6 +67,7 @@ const routes = [
   "POST /tunes/:id/sections",
   "GET /tunes/:id/unchecked-sections",
   "PATCH /sections/:id/check",
+  "POST /tunes/:id/seal",
   "GET /issues",
   "POST /issues",
   "PATCH /issues/:id/status"
@@ -135,13 +138,14 @@ function findTune(db, tuneId) {
 }
 
 function buildProgress(db, tuneId) {
-  findTune(db, tuneId);
+  const tune = findTune(db, tuneId);
   const sections = db.sections.filter((item) => item.tuneId === tuneId);
   const issues = db.issues.filter((item) => item.tuneId === tuneId);
   const checkedCount = sections.filter((item) => item.checked).length;
   const openIssues = issues.filter((item) => item.status !== "resolved").length;
   return {
     tuneId,
+    sealed: Boolean(tune.sealed),
     totalSections: sections.length,
     checkedSections: checkedCount,
     uncheckedSections: sections.length - checkedCount,
@@ -172,6 +176,8 @@ async function handle(req, res) {
       title: body.title,
       composer: body.composer || "",
       stripSpec: body.stripSpec,
+      sealed: false,
+      sealedAt: null,
       createdAt: new Date().toISOString()
     };
     db.tunes.push(tune);
@@ -217,12 +223,37 @@ async function handle(req, res) {
     return send(res, 200, { data: buildProgress(db, progressMatch[1]) });
   }
 
+  const sealMatch = pathname.match(/^\/tunes\/([^/]+)\/seal$/);
+  if (sealMatch && req.method === "POST") {
+    const tune = findTune(db, sealMatch[1]);
+    if (tune.sealed) {
+      return send(res, 200, { data: tune });
+    }
+    const unchecked = db.sections.filter((item) => item.tuneId === tune.id && !item.checked);
+    if (unchecked.length) {
+      return send(res, 409, { error: "存在未核对区间，无法封存", uncheckedSections: unchecked.map((item) => item.id) });
+    }
+    const openIssues = db.issues.filter((item) => item.tuneId === tune.id && item.status !== "resolved");
+    if (openIssues.length) {
+      return send(res, 409, { error: "存在未解决问题，无法封存", openIssues: openIssues.map((item) => item.id) });
+    }
+    tune.sealed = true;
+    tune.sealedAt = new Date().toISOString();
+    await writeDb(db);
+    return send(res, 200, { data: tune });
+  }
+
   const checkMatch = pathname.match(/^\/sections\/([^/]+)\/check$/);
   if (checkMatch && req.method === "PATCH") {
     const section = db.sections.find((item) => item.id === checkMatch[1]);
     if (!section) return send(res, 404, { error: "区间不存在" });
     const body = await parseBody(req);
-    section.checked = body.checked !== undefined ? Boolean(body.checked) : true;
+    const nextChecked = body.checked !== undefined ? Boolean(body.checked) : true;
+    const tune = db.tunes.find((item) => item.id === section.tuneId);
+    if (tune && tune.sealed && !nextChecked) {
+      return send(res, 409, { error: "曲目已封存，无法取消区间核对" });
+    }
+    section.checked = nextChecked;
     section.note = body.note ?? section.note;
     await writeDb(db);
     return send(res, 200, { data: section });
@@ -238,7 +269,8 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/issues") {
     const body = await parseBody(req);
     required(body, ["tuneId", "sectionId", "type", "description"]);
-    findTune(db, body.tuneId);
+    const tune = findTune(db, body.tuneId);
+    if (tune.sealed) return send(res, 409, { error: "曲目已封存，无法新增问题" });
     const section = db.sections.find((item) => item.id === body.sectionId && item.tuneId === body.tuneId);
     if (!section) return send(res, 400, { error: "区间不存在或不属于该曲目" });
     const issue = {
@@ -267,6 +299,11 @@ async function handle(req, res) {
     issue.status = body.status;
     issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
     issue.note = body.note ?? issue.note;
+    const tune = db.tunes.find((item) => item.id === issue.tuneId);
+    if (tune && tune.sealed && body.status !== "resolved") {
+      tune.sealed = false;
+      tune.sealedAt = null;
+    }
     await writeDb(db);
     return send(res, 200, { data: issue });
   }

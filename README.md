@@ -18,9 +18,16 @@ PORT=3019 node server.js
 - `POST /tunes/:id/sections`
 - `GET /tunes/:id/unchecked-sections`
 - `PATCH /sections/:id/check`
+- `POST /tunes/:id/seal`
 - `GET /issues?tuneId=&status=`
 - `POST /issues`
 - `PATCH /issues/:id/status`
+
+## 终检封存
+
+- `POST /tunes/:id/seal`：仅当该曲目全部区间已核对且没有未解决问题时封存成功；否则返回 409，曲目与区间状态不变。已封存的曲目重复封存为幂等成功。
+- 封存后新增问题（`POST /issues`）或取消任一区间核对（`PATCH /sections/:id/check` 传 `checked:false`）均返回 409。
+- 封存后将该曲目已有问题重新打开（`PATCH /issues/:id/status` 传非 `resolved` 状态）会自动解封，原有区间核对与问题历史全部保留。
 
 ## 闭环示例
 
