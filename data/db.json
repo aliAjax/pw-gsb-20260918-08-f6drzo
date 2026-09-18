@@ -10,6 +10,8 @@
         "tempoBpm": 82,
         "paperType": "半透明纸带"
       },
+      "sealed": true,
+      "sealedAt": "2026-09-18T00:49:16.937Z",
       "createdAt": "2026-06-16T00:00:00.000Z"
     }
   ],
@@ -29,7 +31,7 @@
       "startBeat": 33,
       "endBeat": 64,
       "laneRange": "4-18",
-      "checked": false,
+      "checked": true,
       "note": "副歌段等待校对"
     }
   ],
@@ -42,9 +44,9 @@
       "beat": 41,
       "lane": 12,
       "description": "第41拍高音孔漏打",
-      "status": "open",
+      "status": "resolved",
       "createdAt": "2026-06-16T00:00:00.000Z",
-      "resolvedAt": null
+      "resolvedAt": "2026-09-18T00:49:16.932Z"
     }
   ]
 }

@@ -17,6 +17,8 @@ const initialData = {
         tempoBpm: 82,
         paperType: "半透明纸带"
       },
+      sealed: false,
+      sealedAt: null,
       createdAt: new Date().toISOString()
     }
   ],
@@ -64,6 +66,7 @@ const routes = [
   "GET /tunes/:id/sections",
   "POST /tunes/:id/sections",
   "GET /tunes/:id/unchecked-sections",
+  "POST /tunes/:id/seal",
   "PATCH /sections/:id/check",
   "GET /issues",
   "POST /issues",
@@ -134,8 +137,27 @@ function findTune(db, tuneId) {
   return tune;
 }
 
+function isSealed(tune) {
+  return tune.sealed === true;
+}
+
+function conflict(message, extra = {}) {
+  const error = new Error(message);
+  error.status = 409;
+  error.extra = extra;
+  throw error;
+}
+
+function getSections(db, tuneId) {
+  return db.sections.filter((item) => item.tuneId === tuneId);
+}
+
+function getOpenIssues(db, tuneId) {
+  return db.issues.filter((item) => item.tuneId === tuneId && item.status !== "resolved");
+}
+
 function buildProgress(db, tuneId) {
-  findTune(db, tuneId);
+  const tune = findTune(db, tuneId);
   const sections = db.sections.filter((item) => item.tuneId === tuneId);
   const issues = db.issues.filter((item) => item.tuneId === tuneId);
   const checkedCount = sections.filter((item) => item.checked).length;
@@ -147,7 +169,9 @@ function buildProgress(db, tuneId) {
     uncheckedSections: sections.length - checkedCount,
     openIssues,
     resolvedIssues: issues.length - openIssues,
-    percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0
+    percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0,
+    sealed: tune.sealed === true,
+    sealedAt: tune.sealedAt ?? null
   };
 }
 
@@ -172,6 +196,8 @@ async function handle(req, res) {
       title: body.title,
       composer: body.composer || "",
       stripSpec: body.stripSpec,
+      sealed: false,
+      sealedAt: null,
       createdAt: new Date().toISOString()
     };
     db.tunes.push(tune);
@@ -188,7 +214,10 @@ async function handle(req, res) {
 
   if (tuneSectionsMatch && req.method === "POST") {
     const tuneId = tuneSectionsMatch[1];
-    findTune(db, tuneId);
+    const tune = findTune(db, tuneId);
+    if (isSealed(tune)) {
+      return send(res, 409, { error: "曲目已封存，不能新增区间" });
+    }
     const body = await parseBody(req);
     required(body, ["startBeat", "endBeat", "laneRange"]);
     const section = {
@@ -212,6 +241,41 @@ async function handle(req, res) {
     return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId && !item.checked) });
   }
 
+  const sealMatch = pathname.match(/^\/tunes\/([^/]+)\/seal$/);
+  if (sealMatch && req.method === "POST") {
+    const tune = findTune(db, sealMatch[1]);
+    const sections = getSections(db, tune.id);
+    const unchecked = sections.filter((item) => !item.checked);
+    const openIssues = getOpenIssues(db, tune.id);
+
+    if (isSealed(tune)) {
+      conflict("曲目已封存", {
+        sealed: true,
+        sealedAt: tune.sealedAt ?? null
+      });
+    }
+    if (sections.length === 0) {
+      conflict("尚无任何区间，无法封存", {
+        totalSections: 0
+      });
+    }
+    if (unchecked.length) {
+      conflict("存在未核对区间，无法封存", {
+        uncheckedSectionIds: unchecked.map((item) => item.id)
+      });
+    }
+    if (openIssues.length) {
+      conflict("存在未解决问题，无法封存", {
+        openIssueIds: openIssues.map((item) => item.id)
+      });
+    }
+
+    tune.sealed = true;
+    tune.sealedAt = new Date().toISOString();
+    await writeDb(db);
+    return send(res, 200, { data: { tune, progress: buildProgress(db, tune.id) } });
+  }
+
   const progressMatch = pathname.match(/^\/tunes\/([^/]+)\/progress$/);
   if (progressMatch && req.method === "GET") {
     return send(res, 200, { data: buildProgress(db, progressMatch[1]) });
@@ -221,8 +285,13 @@ async function handle(req, res) {
   if (checkMatch && req.method === "PATCH") {
     const section = db.sections.find((item) => item.id === checkMatch[1]);
     if (!section) return send(res, 404, { error: "区间不存在" });
+    const tune = findTune(db, section.tuneId);
     const body = await parseBody(req);
-    section.checked = body.checked !== undefined ? Boolean(body.checked) : true;
+    const nextChecked = body.checked !== undefined ? Boolean(body.checked) : true;
+    if (isSealed(tune) && !nextChecked) {
+      return send(res, 409, { error: "曲目已封存，不能取消区间核对", sectionId: section.id });
+    }
+    section.checked = nextChecked;
     section.note = body.note ?? section.note;
     await writeDb(db);
     return send(res, 200, { data: section });
@@ -238,7 +307,10 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/issues") {
     const body = await parseBody(req);
     required(body, ["tuneId", "sectionId", "type", "description"]);
-    findTune(db, body.tuneId);
+    const tune = findTune(db, body.tuneId);
+    if (isSealed(tune)) {
+      return send(res, 409, { error: "曲目已封存，不能新增问题", tuneId: body.tuneId });
+    }
     const section = db.sections.find((item) => item.id === body.sectionId && item.tuneId === body.tuneId);
     if (!section) return send(res, 400, { error: "区间不存在或不属于该曲目" });
     const issue = {
@@ -264,18 +336,37 @@ async function handle(req, res) {
     if (!issue) return send(res, 404, { error: "问题不存在" });
     const body = await parseBody(req);
     required(body, ["status"]);
+    const tune = findTune(db, issue.tuneId);
+    const reopened = issue.status === "resolved" && body.status !== "resolved";
+    const unsealed = isSealed(tune) && reopened;
+
     issue.status = body.status;
     issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
     issue.note = body.note ?? issue.note;
+
+    if (unsealed) {
+      // 重新打开已封存曲目的问题时自动解封，保留原有核对与问题历史
+      tune.sealed = false;
+      tune.sealedAt = null;
+    }
+
     await writeDb(db);
-    return send(res, 200, { data: issue });
+    return send(res, 200, {
+      data: issue,
+      unsealed,
+      note: unsealed
+        ? "问题已重新打开，曲目自动解封；原有核对与问题历史均保留"
+        : undefined
+    });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  handle(req, res).catch((error) =>
+    send(res, error.status || 500, { error: error.message || "服务器错误", ...(error.extra || {}) })
+  );
 });
 
 server.listen(PORT, () => {
